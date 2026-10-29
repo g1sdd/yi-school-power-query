@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#ffffff" />
+<title>直连导入 · 寝室电费</title>
+<link rel="icon" href="/icons/favicon.png" />
+<style>
+  :root{
+    --bg:#f5f6f8; --card:#fff; --line:#e8eaed; --line2:#f0f1f3;
+    --fg:#1f2329; --sub:#8a919f; --faint:#b0b6c0;
+    --brand:#2563eb; --brand-soft:#eff4ff;
+    --ok:#10b981; --warn:#f59e0b; --crit:#ef4444;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{
+    margin:0;min-height:100dvh;display:flex;align-items:center;justify-content:center;
+    background:var(--bg);color:var(--fg);padding:20px;
+    font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{width:100%;max-width:560px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:26px 22px}
+  .logo{width:46px;height:46px;border-radius:13px;background:var(--brand-soft);
+        display:flex;align-items:center;justify-content:center;font-size:24px;margin-bottom:14px}
+  h1{margin:0 0 3px;font-size:19px;font-weight:600}
+  .lead{color:var(--sub);font-size:13.5px;margin-bottom:18px}
+  label{display:block;font-size:13px;color:var(--sub);margin:16px 0 7px}
+  textarea{width:100%;min-height:150px;background:#fff;color:var(--fg);border:1px solid var(--line);
+        border-radius:10px;padding:12px 13px;font-size:12.5px;line-height:1.6;font-family:ui-monospace,Menlo,Consolas,monospace;
+        outline:none;resize:vertical}
+  textarea:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(37,99,235,.08)}
+  textarea::placeholder{color:var(--faint)}
+  button{background:#fff;color:var(--fg);border:1px solid var(--line);border-radius:10px;
+        padding:12px 16px;font-size:14.5px;font-family:inherit;cursor:pointer;white-space:nowrap;
+        transition:border-color .15s,background .15s}
+  button:hover:not(:disabled){border-color:#cfd4dc}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  button.primary{width:100%;margin-top:14px;background:var(--brand);border-color:var(--brand);
+        color:#fff;font-weight:500;font-size:15.5px;padding:13px}
+  button.primary:hover:not(:disabled){background:#1d4ed8;border-color:#1d4ed8}
+  button.link{background:none;border:0;color:var(--brand);padding:0;font-size:13.5px}
+  .hint{font-size:12.5px;color:var(--sub);margin-top:8px;line-height:1.8}
+  .msg{margin-top:14px;padding:11px 13px;border-radius:10px;font-size:13.5px;display:none;line-height:1.6}
+  .msg.err{display:block;background:#fef2f2;border:1px solid #fecaca;color:#b91c1c}
+  .msg.ok{display:block;background:#ecfdf5;border:1px solid #a7f3d0;color:#047857}
+  .msg.info{display:block;background:var(--brand-soft);border:1px solid #dbeafe;color:#1e40af}
+  pre{background:#f7f8fa;border:1px solid var(--line);border-radius:10px;padding:12px;
+      font-size:11.5px;color:#4b5563;white-space:pre-wrap;line-height:1.7;margin:10px 0 0;
+      font-family:ui-monospace,Menlo,Consolas,monospace;max-height:300px;overflow:auto}
+  .hide{display:none}
+  .foot{margin-top:22px;padding-top:18px;border-top:1px solid var(--line2);
+        color:var(--faint);font-size:12px;line-height:1.8}
+  a{color:var(--brand);text-decoration:none}
+  code{background:#f3f4f6;padding:1px 5px;border-radius:5px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="logo">🔌</div>
+    <h1>直连导入</h1>
+    <div class="lead">不经过 tool.no-fish.cn。粘贴抓到的请求，直接请求 <code>application.xiaofubao.com</code>。</div>
+
+    <label>抓包请求（cURL / 原始 HTTP / body 都行）</label>
+    <textarea id="curlText" spellcheck="false" placeholder="curl 'https://application.xiaofubao.com/app/electric/queryRoomSurplus' -H 'Cookie: shiroJID=...' --data-raw 'areaId=...&buildingCode=...&floorCode=...&roomCode=...&platform=DING_TALK_H5'"></textarea>
+    <div class="hint">
+      手机抓包：HttpCanary / Reqable / Stream，点一次「电费查询」，把
+      <code>queryRoomSurplus</code> 请求复制成 cURL 粘进来。<br/>
+      抓到后尽快导入（会话票据可能几分钟就过期）；不要导出整份 HAR，里面可能有别的账号 Cookie。<br/>
+      电脑抓包：DevTools → Network → 右键该请求 → Copy → Copy as cURL。
+    </div>
+
+    <button class="primary" id="importBtn">解析并测试</button>
+    <div class="msg" id="msg"></div>
+    <pre id="rawBox" class="hide"></pre>
+
+    <div class="foot">
+      会话只保存在本机数据库；请求直接发往易校园上游。<br/>
+      <a href="/">← 返回仪表盘</a>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+function say(t, kind="info"){
+  const m=$("#msg"); m.className="msg "+kind; m.textContent=t;
+}
+$("#importBtn").onclick = async () => {
+  const text = $("#curlText").value.trim();
+  const btn = $("#importBtn"), raw = $("#rawBox");
+  if(!text){ say("先粘贴抓到的请求", "err"); return; }
+  btn.disabled = true; btn.textContent = "测试中…";
+  raw.classList.add("hide"); say("正在直连易校园上游…", "info");
+  try{
+    const r = await fetch("/api/auth/import-curl", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({curl:text})
+    });
+    const j = await r.json().catch(()=>({error:"请求失败"}));
+    if(!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+    const room = j.room || {};
+    say(`导入成功：ymId ${j.ym_id}，房间 ${room.label || room.room_name || "已登记"}`, "ok");
+    raw.classList.remove("hide");
+    raw.textContent = JSON.stringify(j.raw, null, 2);
+    setTimeout(()=>location.replace("/"), 2200);
+  }catch(e){
+    say(e.message, "err");
+  }finally{
+    btn.disabled = false; btn.textContent = "解析并测试";
+  }
+};
+</script>
+</body>
+</html>
