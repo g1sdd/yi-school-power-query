@@ -164,11 +164,15 @@ secret_key()                     # data/direct.key，首次自动生成
 | POST | `/api/direct/login` | `session_id`、`sms_code` | `token`、`user{phone,school}`、`rooms[]` |
 | POST | `/api/direct/query` | `room_index` + 令牌 | `balance{amount,surplus}`、`room`、`raw` |
 | GET | `/api/direct/session` | 令牌 | `user`、`rooms`、`has_login` |
-| POST | `/api/direct/logout` | 令牌 | `{ok:true}` |
+| GET | `/api/direct/me` | 令牌 | 当前用户自己的寝室与最近余额 |
+| POST | `/api/direct/logout` | 令牌 | `{ok:true}`，同时清 Cookie |
+| POST | `/api/direct/adopt` | `token` | 把旧 localStorage 令牌换成 Cookie |
 | GET | `/api/direct/status` | `session_id` | 登录过程快照 |
 | POST | `/api/direct/close` | `session_id` | 丢掉一次性会话 |
 
-令牌放请求头 `X-YS-Token`（也接受 body/query 里的 `token`），**不放 URL** —— 免得进访问日志。
+登录成功后服务端下发 **httpOnly Cookie** `ysp_session`（30 天），浏览器自己带着，
+JS 读不到；接口也接受请求头 `X-YS-Token` 或 body 里的 `token`（给脚本/CLI 用），
+**不放 URL** —— 免得进访问日志。
 
 失败统一返回 `{"error": "人话", "kind": "captcha|token|phone|code|limit|expired|relogin|...", "direct": true}`，
 `kind=limit` 用 HTTP 429，其余 400。
@@ -191,7 +195,7 @@ secret_key()                     # data/direct.key，首次自动生成
 | `dsessions` | 一个浏览器 | `token_hash`（sha256）、`user_id`、`shiro_sealed`（加密）、`expires_at` |
 | `drooms` | 一个寝室 | `user_id`、`area/building/floor/room_code`、`label`、`last_amount`、`last_surplus` |
 
-- 令牌是 `secrets.token_urlsafe(32)`，**库里只存 sha256**，原文只在你浏览器 `localStorage`。
+- 令牌是 `secrets.token_urlsafe(32)`，**库里只存 sha256**，原文只在浏览器的 httpOnly Cookie 里。
 - `shiroJID` 用 AES-128-CTR + HMAC-SHA256 加密后存（密钥 `data/direct.key`，16 字节，`chmod 600`）。
   密钥丢了 = 所有已存登录失效，重新收一次短信即可，不会崩。
 - 同一手机号在别的设备再登录会新建一个 `dsessions` 行，旧设备各自持有自己的票据。
@@ -206,7 +210,21 @@ secret_key()                     # data/direct.key，首次自动生成
 | 上游解绑了房间 | 下次登录时 `save_rooms` 会把这个房间从 `drooms` 删掉 |
 | 令牌过期 / 手动退出 | 删除 `dsessions` 行，下次要重新收短信 |
 
-### 6.3 为什么还是会要你重新收短信
+### 6.3 页面路由
+
+| 路径 | 谁能看 | 内容 |
+|---|---|---|
+| `/login` | 未登录 | 登录页（手机号 + 学校 + 图形验证码 + 短信码），成功后跳 `/` |
+| `/` | 已登录 | 本地有在采集的房间 → 完整仪表盘；只有余额 → 简版「我的寝室」 |
+| `/me` | 已登录 | 简版「我的寝室」：自己的房间 + 上次查到的余额 |
+| `/setup` | 站主 | 采集账号（nofish）的重新登录向导 |
+| `/import` | 已登录 | 粘贴抓包请求 |
+| `/direct` | — | 301 到 `/login`（老链接） |
+
+主页面按「这个账号名下的房间在本地有没有被采集」自动选：有历史就给仪表盘，
+没有就给简版页，不会把别人的数据端出来。
+
+### 6.4 为什么还是会要你重新收短信
 
 `shiroJID` 的有效期由易校园决定，不是我们能续的。实测 H5 的票据十几分钟就废，
 App 登录的票据明显更久（具体多久还在观察）。所以设计成：

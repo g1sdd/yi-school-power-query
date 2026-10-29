@@ -25,7 +25,7 @@ python cli.py serve           # http://127.0.0.1:8787
 
 ```bash
 python cli.py login     # 终端里输手机号 + 短信验证码，不抓包
-python cli.py serve     # 或者打开 /login 跟着向导走
+python cli.py serve     # 或者打开 /setup 跟着向导走
 ```
 
 ## 数据源
@@ -36,17 +36,18 @@ python cli.py serve     # 或者打开 /login 跟着向导走
 | `demo` | 生成带真实感的演示曲线 | 无 |
 | `xiaofubao` | 直接调易校园上游接口 | 抓包得到 `shiroJID` 与房间参数 |
 
-另有网页版 `/direct`（见下），不需要改 `source.type`。
+另有网页登录 `/login`（见下），不需要改 `source.type`。
 
-## `/direct`：多人查询
+## 登录与多人查询
 
-`http://<地址>:8787/direct` —— 手机号 + 学校 + 图形验证码，收短信后即可查余额。
+`/login` 是登录页：手机号 + 学校 + 图形验证码，收到短信后登录，成功后进入主页面。
 
-![查询页](docs/direct.png)
+![登录页](docs/login.png)
 
+- 登录态是 httpOnly Cookie，记 30 天；下次打开直接进，不用反复收短信；
 - 每个手机号一个账号，房间和余额互相独立；
-- 浏览器记住 30 天，下次打开直接查，不用反复收短信；
-- 学校从内置列表里选（可输入筛选），默认中国计量大学；
+- 主页面 `/`：本地有在采集的房间就显示完整仪表盘，没有就显示简版的「我的寝室」；
+- `/setup` 是采集账号（nofish）的重新登录入口，一般只有站主用得到；
 - 图形验证码由人眼看图输入，不做自动识别。
 
 命令行等价：
@@ -79,8 +80,8 @@ GET  /api/summary  series  daily  hourly  weekday  forecast  anomalies
 POST /api/collect
 GET  /api/auth/status  schools
 POST /api/auth/send-code  login  logout  import-curl
-GET  /api/direct/schools  session
-POST /api/direct/start  send-code  login  query  logout
+GET  /api/direct/schools  session  me
+POST /api/direct/start  send-code  login  query  logout  adopt
 ```
 
 都是 JSON，开了 CORS，浏览器里直接 `fetch` 即可。
