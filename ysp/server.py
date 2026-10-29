@@ -123,8 +123,51 @@ def _client_ip() -> str:
     return str(getattr(_local, "client_addr", "") or "")
 
 
+SESSION_COOKIE = "ysp_session"
+
+
+def _cookie_header(name: str, value: str, max_age: int | None = None) -> str:
+    parts = [f"{name}={value}", "Path=/", "HttpOnly", "SameSite=Lax"]
+    parts.append(f"Max-Age={int(max_age)}" if max_age is not None else "Max-Age=0")
+    return "; ".join(parts)
+
+
+def _queue_cookie(header: str) -> None:
+    """Set-Cookie 先记在 thread-local，等 _json / _static 发响应时一起带上。"""
+    _local.cookie = header
+
+
+def current_session() -> dict | None:
+    """当前请求带着的浏览器会话（Cookie 或 X-YS-Token 都认）。"""
+    tok = str(getattr(_local, "token", "") or "").strip()
+    if not tok:
+        return None
+    try:
+        return dstore.get_session(conn(), dstore.hash_token(tok))
+    except Exception:  # noqa: BLE001  读库出问题就当没登录
+        return None
+
+
+def _user_has_local_room(row: dict) -> bool:
+    """这个账号名下的寝室，本地库有没有在采（决定给仪表盘还是简版页）。"""
+    try:
+        mine = dstore.list_rooms(conn(), int(row["user_id"]))
+        if not mine:
+            return False
+        codes = {(r["area_id"], r["building_code"], r["floor_code"], r["room_code"])
+                 for r in mine}
+        for r in db.list_rooms(conn(), enabled_only=True):
+            key = (str(r.get("area_id") or ""), str(r.get("building_code") or ""),
+                   str(r.get("floor_code") or ""), str(r.get("room_code") or ""))
+            if key in codes:
+                return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
 def _client_token(body: dict | None = None) -> str:
-    """浏览器令牌：优先请求头，其次 body/query（GET 也走头）。"""
+    """浏览器令牌：Cookie 优先，其次请求头，最后 body（GET 也走头）。"""
     tok = str(getattr(_local, "token", "") or "").strip()
     if not tok and body:
         tok = str(body.get("token") or "").strip()
@@ -274,13 +317,15 @@ def api_direct_login(body):
         out["warning"] = "登录成功，但这个手机号名下没有绑定寝室。"
         return out
 
-    # 落库成这个手机号的账号 + 浏览器令牌（下次打开不用再收短信）
+    # 落库成这个手机号的账号 + 浏览器会话（下次打开不用再收短信）
     conn_ = conn()
     user = dstore.upsert_user(conn_, s.phone, s.client.school_code,
                               s.client.school_name, s.client.uid)
     dstore.save_rooms(conn_, user["id"], s.rooms)
     token, row = dstore.create_session(conn_, user["id"], s.client.session_token,
                                        days=_persist_days(), ip=_client_ip())
+    # 浏览器走 Cookie：httpOnly，JS 读不到，刷新/关掉再开都还在
+    _queue_cookie(_cookie_header(SESSION_COOKIE, token, _persist_days() * 86400))
     out.update({
         "token": token,
         "user": dstore.public_user(user),
@@ -289,8 +334,34 @@ def api_direct_login(body):
     return out
 
 
+def api_direct_adopt(body):
+    """把老的 localStorage 令牌换成 Cookie（升级兼容，登录页自动调用一次）。"""
+    tok = str(body.get("token") or "").strip()
+    row = dstore.get_session(conn(), dstore.hash_token(tok)) if tok else None
+    if not row:
+        return {"ok": False}
+    dstore.touch_session(conn(), str(row["token_hash"]), days=_persist_days())
+    _queue_cookie(_cookie_header(SESSION_COOKIE, tok, _persist_days() * 86400))
+    return {"ok": True, "user": dstore.public_user(row)}
+
+
+def api_direct_me(q):
+    """当前登录用户自己的寝室与最近一次查到的余额（简版主页用）。"""
+    row = current_session()
+    if not row:
+        raise dl.LoginError("请先登录", "expired")
+    rooms = dstore.list_rooms(conn(), int(row["user_id"]))
+    return {
+        "ok": True,
+        "user": dstore.public_user(row),
+        "rooms": rooms,
+        "expires_at": row.get("expires_at"),
+        "has_login": bool(row.get("shiro_sealed")),
+    }
+
+
 def api_direct_session(q):
-    """页面打开时用它恢复登录状态（令牌在请求头 X-YS-Token 或 ?token=）。"""
+    """页面打开时用它恢复登录状态（Cookie / 请求头 X-YS-Token / ?token= 都认）。"""
     tok = (q.get("token") or [""])[0] or _client_token()
     if not tok:
         return {"ok": True, "exists": False}
@@ -311,12 +382,13 @@ def api_direct_session(q):
 
 
 def api_direct_logout(body):
-    tok = _client_token(body)
+    tok = _client_token(body) or str(body.get("token") or "").strip()
     if tok:
         dstore.delete_session(conn(), dstore.hash_token(tok))
     sid = str(body.get("session_id") or "")
     if sid:
         direct_sessions().drop(sid)
+    _queue_cookie(_cookie_header(SESSION_COOKIE, "", 0))   # 顺手让浏览器把 Cookie 丢掉
     return {"ok": True}
 
 
@@ -1391,9 +1463,10 @@ ROUTES_GET = {
     "/api/auth/floors": api_auth_floors,
     "/api/auth/rooms": api_auth_rooms,
     "/api/direct/status": api_direct_status,
-    # 直连一次性查询
+    # 登录与多用户
     "/api/direct/schools": api_direct_schools,
     "/api/direct/session": api_direct_session,
+    "/api/direct/me": api_direct_me,
 }
 
 ROUTES_POST = {
@@ -1416,6 +1489,7 @@ ROUTES_POST = {
     "/api/direct/login": api_direct_login,
     "/api/direct/query": api_direct_query,
     "/api/direct/logout": api_direct_logout,
+    "/api/direct/adopt": api_direct_adopt,
     "/api/direct/close": api_direct_close,
 }
 
@@ -1438,6 +1512,11 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     # -- utils
+    def _set_cookie(self) -> None:
+        ck = str(getattr(_local, "cookie", "") or "")
+        if ck:
+            self.send_header("Set-Cookie", ck)
+
     def _json(self, obj, status=200):
         if isinstance(obj, dict) and "__csv__" in obj:
             data = obj["__csv__"].encode("utf-8-sig")
@@ -1455,8 +1534,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Cache-Control", "no-store")
+        self._set_cookie()
         self.end_headers()
         self._write(data)
+
+    def _redirect(self, location: str, status: int = 302):
+        self.send_response(status)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self._set_cookie()
+        self.end_headers()
 
     def _static(self, path: str):
         rel = path.lstrip("/") or "index.html"
@@ -1487,6 +1575,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         # 静态资源不缓存，避免改了前端却看到旧页面
         self.send_header("Cache-Control", "no-store, must-revalidate")
+        self._set_cookie()
         self.end_headers()
         self._write(data)
 
@@ -1498,14 +1587,68 @@ class Handler(BaseHTTPRequestHandler):
             return xff
         return self.client_address[0] if self.client_address else ""
 
+    def _cookie(self, name: str) -> str:
+        raw = self.headers.get("Cookie") or ""
+        for part in raw.split(";"):
+            k, _, v = part.partition("=")
+            if k.strip() == name:
+                return v.strip()
+        return ""
+
     def _stash(self) -> None:
         """把每个请求都需要的上下文放进 thread-local。"""
         _local.client_addr = self._addr()
-        _local.token = (self.headers.get("X-YS-Token") or "").strip()
+        _local.token = ((self.headers.get("X-YS-Token") or "").strip()
+                        or self._cookie(SESSION_COOKIE))
+        _local.cookie = ""
+
+    def _page(self, name: str) -> None:
+        self._static("/" + name)
+
+    def _gate(self, need_login: bool = True) -> dict | None:
+        """页面级登录闸门：没登录就跳 /login。"""
+        row = current_session()
+        if need_login and not row:
+            self._redirect("/login")
+            return None
+        return row
 
     def do_GET(self):
         u = urlparse(self.path)
         self._stash()
+        path = u.path.rstrip("/") or "/"
+
+        # 页面路由
+        if path == "/":
+            row = self._gate()
+            if row is None:
+                return
+            # 有本地采集的房间 → 完整仪表盘；只有余额的账号 → 简版主页
+            self._page("index.html" if _user_has_local_room(row) else "me.html")
+            return
+        if path == "/login":
+            if current_session():
+                self._redirect("/")
+                return
+            self._page("login.html")
+            return
+        if path == "/me":
+            if self._gate() is None:
+                return
+            self._page("me.html")
+            return
+        if path == "/direct":                      # 老链接，直接跳过去
+            self._redirect("/login", 301)
+            return
+        if path == "/setup":                       # 采集账号（nofish）的登录向导
+            self._page("setup.html")
+            return
+        if path == "/import":                      # 粘贴抓包请求（站主用）
+            if self._gate() is None:
+                return
+            self._page("import.html")
+            return
+
         if u.path in ROUTES_GET:
             q = parse_qs(u.query)
             try:
@@ -1798,11 +1941,10 @@ def main():
     start_collector()
 
     srv = ThreadingHTTPServer((host, port), Handler)
-    print(f"→ 仪表盘  http://{host}:{port}/")
+    print(f"→ 仪表盘  http://{host}:{port}/（未登录会跳 /login）")
+    print(f"→ 登录页  http://{host}:{port}/login")
     if kind == "nofish":
-        print(f"→ 登录页  http://{host}:{port}/login")
-    if (CFG.get("direct") or {}).get("enabled", True):
-        print(f"→ 直连查询 http://{host}:{port}/direct")
+        print(f"→ 采集账号 http://{host}:{port}/setup")
     print(f"→ 接口    http://{host}:{port}/api/summary")
     print("Ctrl+C 退出")
     try:

@@ -264,6 +264,7 @@
         <option value="kwh">度</option>
       </select>
       <button id="refresh" title="刷新">刷新</button>
+      <button id="logout" title="退出登录">退出</button>
     </div>
   </div>
 </header>
@@ -769,7 +770,7 @@ function renderNotes(baseNotes, s){
   const notes = baseNotes.slice();
   const st = state.quality || {};
   if (st.session && st.session.need_relogin){
-    notes.push(`<div class="note crit"><div>🔑</div><div>登录已过期，需要重新验证一次。<a href="/login">去登录</a></div></div>`);
+    notes.push(`<div class="note crit"><div>🔑</div><div>登录已过期，需要重新验证一次。<a href="/setup">去登录</a></div></div>`);
   } else if (st.stale_segments && st.stale_segments.length){
     const g = st.stale_segments[st.stale_segments.length-1];
     const hrs = Math.round(g.hours);
@@ -1283,6 +1284,13 @@ async function load(){
 /* ---------------- 交互 ---------------- */
 $("#unitSel").onchange = e => { state.viewUnit = e.target.value; load(); };
 $("#refresh").onclick = () => load();
+$("#logout").onclick = async () => {
+  try{
+    await fetch("/api/direct/logout", {method: "POST", credentials: "same-origin",
+      headers: {"Content-Type": "application/json"}, body: "{}"});
+  }catch(e){}
+  location.replace("/login");
+};
 $("#calcW").oninput = renderCalc;
 $("#calcH").oninput = renderCalc;
 $("#heatSeg").querySelectorAll("button").forEach(b => {
@@ -1321,7 +1329,7 @@ window.addEventListener("resize", () => Object.values(state.charts).forEach(c=>c
   try{
     const st = await fetch("/api/auth/status").then(r=>r.json());
     if (st.login_required && (!st.logged_in || st.need_relogin || st.need_location)){
-      location.replace("/login"); return;
+      location.replace("/setup"); return;
     }
   }catch(e){}
   load();
