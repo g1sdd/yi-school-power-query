@@ -3,6 +3,7 @@
 
   python cli.py init                初始化数据库与房间配置
   python cli.py login               终端登录（手机号 + 短信验证码，无需抓包）
+  python cli.py direct-login        直连登录：手机号 → 图形码 → 短信码 → 余额（不落库）
   python cli.py seed-demo [天数]    写入演示数据（无需凭据，先看效果）
   python cli.py import-curl [文件]  直接导入抓包请求（绕过 nofish，直连上游）
   python cli.py check               自检登录态与数据源
@@ -18,9 +19,12 @@ python cli.py serve               启动 Web 仪表盘
 """
 from __future__ import annotations
 
+import base64
 import csv
 import io
 import json
+import os
+import re
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -1023,6 +1027,124 @@ def cmd_selftest(argv):
     return 0 if ok else 1
 
 
+def cmd_direct_login(argv):
+    """易校园 App 直连登录：手机号 → 图形码 → 短信码 → 房间 → 余额。
+
+    不落库、不抓包，也不经过 tool.no-fish.cn。会话只在这次进程里。
+    """
+    from ysp import direct_login as dl
+    from ysp.config import ROOT
+
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        print("  python cli.py direct-login [--phone 138xxxxxxxx] [--school 10356]"
+              "\n                             [--captcha abcd] [--code 123456]"
+              " [--room 1] [--open]")
+        return 0
+
+    def opt(name, default=""):
+        if name in argv:
+            i = argv.index(name)
+            if i + 1 < len(argv):
+                return argv[i + 1]
+        for a in argv:
+            if a.startswith(name + "="):
+                return a.split("=", 1)[1]
+        return default
+
+    cfg = load_config()
+    dcfg = cfg.get("direct") or {}
+    school = str(opt("--school", dcfg.get("school_code") or dl.DEFAULT_SCHOOL_CODE))
+    school_name = str(dcfg.get("school_name") or dl.DEFAULT_SCHOOL_NAME)
+    timeout = int(dcfg.get("timeout", 20) or 20)
+
+    phone = re.sub(r"\D", "", str(opt("--phone") or input("手机号（11 位，必须是本人的）：")).strip())
+    if not (len(phone) == 11 and phone.isdigit()):
+        print("✗ 手机号要是 11 位数字")
+        return 1
+
+    cli = dl.DirectLogin(dev_id=dl.device_id(), school_code=school,
+                         school_name=school_name, timeout=timeout,
+                         verify_tls=bool(dcfg.get("verify_tls", False)))
+    print(f"→ 学校 {school_name}（{school}），手机号 {dl.mask_phone(phone)}")
+
+    try:
+        st = cli.security_token()
+        cap = cli.captcha_image(st["security_token"])
+    except dl.LoginError as e:
+        print(f"✗ 取图形验证码失败：{e}")
+        return 1
+
+    # 图形码存成图片，让人自己看（不做任何自动识别）
+    ext = "jpg" if "jpeg" in (cap.get("mime") or "") else "png"
+    out = ROOT / "data" / f"direct-captcha.{ext}"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(base64.b64decode(cap["image"]))
+    print(f"→ 图形验证码已存到：{out}")
+    print("  打开这张图，看图输入下面的验证码（点不到就手动打开路径）。")
+    if "--open" in argv:
+        try:
+            os.startfile(str(out))  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+
+    captcha = str(opt("--captcha") or input("图形验证码：")).strip()
+    try:
+        cli.send_code(phone, st["security_token"], captcha)
+    except dl.LoginError as e:
+        print(f"✗ 发短信失败：{e}")
+        if e.kind in ("captcha", "token"):
+            print("  提示：重跑一次会取新的图形验证码。")
+        return 1
+    print(f"✓ 短信已发到 {dl.mask_phone(phone)}")
+
+    code = re.sub(r"\D", "", str(opt("--code") or input("短信验证码：")).strip())
+    try:
+        cli.login_by_code(phone, code)
+        print("✓ 登录成功（用户 ID 已隐藏）")
+        ym_code = cli.auth_code()
+        cli.shiro_jid(ym_code)
+        print("✓ 已拿到电费会话（shiroJID，只在内存里）")
+        rooms = cli.query_bind()
+    except dl.LoginError as e:
+        print(f"✗ 登录/取房间失败：{e}")
+        return 1
+
+    if not rooms:
+        print("✗ 这个账号在电费系统里没有绑定寝室（可能学校没开通，或需要先在 App 里绑定）")
+        return 1
+
+    print(f"\n已绑定 {len(rooms)} 个寝室：")
+    for i, r in enumerate(rooms, 1):
+        print(f"  [{i}] {r.get('label') or r.get('room_name')}")
+    pick = str(opt("--room") or "").strip()
+    if not pick:
+        pick = input(f"选择序号（1-{len(rooms)}，直接回车=1）：").strip() or "1"
+    try:
+        idx = max(1, min(len(rooms), int(pick)))
+    except ValueError:
+        idx = 1
+    room = rooms[idx - 1]
+
+    try:
+        res = cli.query_room_surplus(room)
+    except dl.LoginError as e:
+        print(f"✗ 查余额失败：{e}")
+        return 1
+
+    print("\n" + "=" * 62)
+    print(f"  {res.get('room_label') or room.get('label')}")
+    print("=" * 62)
+    print(f"  当前余额     {res.get('amount')} 元   （上游 amount）")
+    print(f"  剩余电量     {res.get('surplus')} 度   （上游 surplus）")
+    print(f"  显示开关     isShowMoney={res.get('is_show_money')} · "
+          f"isShowSurplus={res.get('is_show_surplus')}")
+    print("\n  上游原始响应：")
+    print(json.dumps(res.get("data"), ensure_ascii=False, indent=2))
+    print("\n  说明：这次登录只在这个进程里，验证码/会话都没写进数据库或日志。")
+    return 0
+
+
 def cmd_import_curl(argv):
     """直接导入抓包请求：python cli.py import-curl [文件] [--dry-run]"""
     from ysp import direct
@@ -1059,6 +1181,7 @@ def cmd_import_curl(argv):
 COMMANDS = {
     "init": cmd_init,
     "login": cmd_login,
+    "direct-login": cmd_direct_login,
     "seed-demo": cmd_seed,
     "import-curl": cmd_import_curl,
     "check": cmd_check,
