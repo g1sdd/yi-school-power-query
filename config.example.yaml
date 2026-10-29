@@ -1,4 +1,4 @@
-# 复制为 config.yaml 后按注释修改
+﻿# 复制为 config.yaml 后按注释修改
 # 本文件是纯文本 YAML；项目自带极简解析器，没有 PyYAML 也能读。
 
 app:
@@ -65,6 +65,31 @@ source:
   # 上游证书过期或校园网做 TLS 中间人时自动降级为不校验（会打印一次告警）
   # 想强制校验并让请求直接失败，设 true
   strict_tls: false
+
+# 直连一次性查询（/direct）：任意用户用本人手机号 + 本人短信验证码
+# 登录易校园官方 App 接口，查本人寝室电费。
+# ⚠️ 会话只放内存、30 分钟过期，不落库、不写日志；不做长期采集。
+direct:
+  enabled: true
+  # 默认学校：中国计量大学。页面上可以临时改。
+  school_code: "10356"
+  school_name: 中国计量大学
+  # 登录过程（验证码→短信→登录）的一次性会话，只在内存里
+  session_ttl_minutes: 30
+  max_sessions: 500
+  # 浏览器记住登录多少天；shiroJID 用 data/direct.key 加密后存本机库，
+  # 只有到期或上游把票据作废时才需要重新收一次短信
+  persist_days: 30
+  # 发短信限流：上游自己也有风控，本地先拦一道
+  send_interval_seconds: 60   # 同一手机号两次发送的最小间隔
+  phone_daily_limit: 6        # 同一手机号每天最多发几次
+  ip_daily_limit: 20          # 同一 IP 每天最多发几次
+  start_hourly_limit: 60      # 同一 IP 每小时最多建几次查询会话（每建一次会请求两下上游）
+  timeout: 20
+  verify_tls: false
+  # 上游版本号：易校园改版时需要跟着改（UA 与 appSecurityToken 都用到）
+  app_all_version: "7.3.6"
+  client_id: "65l3attk4r095ib"
 
 # 房间：nofish 模式下不用手写，登录并绑定宿舍后会自动生成一条
 rooms:

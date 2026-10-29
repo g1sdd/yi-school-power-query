@@ -8,6 +8,7 @@ import csv
 import io
 import json
 import mimetypes
+import re
 import threading
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +16,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import analyze, db
+from . import direct_login as dl
+from . import direct_schools as ds
+from . import direct_store as dstore
 from .auth import (
     AuthClient,
     AuthError,
@@ -55,6 +59,353 @@ def auth_client() -> AuthClient:
     return AuthClient(str(src.get("base_url") or "https://tool.no-fish.cn"),
                       int(src.get("timeout", 20)),
                       bool(src.get("strict_tls", False)))
+
+
+# ---------------------------------------------------------------- 直连（一次性查询）
+# 会话只在内存里：进程重启就没了，30 分钟自动过期，不落库、不写日志。
+
+_DIRECT_SESSIONS: dl.DirectSessions | None = None
+_DIRECT_LIMITER: dl.SendLimiter | None = None
+_DIRECT_THROTTLE: dl.HourThrottle | None = None
+_DIRECT_LOCK = threading.Lock()
+
+
+def direct_cfg() -> dict:
+    return dict(CFG.get("direct") or {})
+
+
+def direct_sessions() -> dl.DirectSessions:
+    global _DIRECT_SESSIONS
+    if _DIRECT_SESSIONS is None:
+        with _DIRECT_LOCK:
+            if _DIRECT_SESSIONS is None:
+                c = direct_cfg()
+                _DIRECT_SESSIONS = dl.DirectSessions(
+                    ttl=int(c.get("session_ttl_minutes", 30) or 30) * 60,
+                    max_sessions=int(c.get("max_sessions", 500) or 500))
+    return _DIRECT_SESSIONS
+
+
+def direct_limiter() -> dl.SendLimiter:
+    global _DIRECT_LIMITER
+    if _DIRECT_LIMITER is None:
+        with _DIRECT_LOCK:
+            if _DIRECT_LIMITER is None:
+                c = direct_cfg()
+                _DIRECT_LIMITER = dl.SendLimiter(
+                    interval_seconds=int(c.get("send_interval_seconds", 60) or 60),
+                    phone_daily=int(c.get("phone_daily_limit", 6) or 6),
+                    ip_daily=int(c.get("ip_daily_limit", 20) or 20))
+    return _DIRECT_LIMITER
+
+
+def reset_direct_state() -> None:
+    """测试用：丢掉全部内存会话与限流计数。"""
+    global _DIRECT_SESSIONS, _DIRECT_LIMITER, _DIRECT_THROTTLE
+    with _DIRECT_LOCK:
+        _DIRECT_SESSIONS = None
+        _DIRECT_LIMITER = None
+        _DIRECT_THROTTLE = None
+
+
+def direct_throttle() -> dl.HourThrottle:
+    global _DIRECT_THROTTLE
+    if _DIRECT_THROTTLE is None:
+        with _DIRECT_LOCK:
+            if _DIRECT_THROTTLE is None:
+                c = direct_cfg()
+                _DIRECT_THROTTLE = dl.HourThrottle(
+                    per_hour=int(c.get("start_hourly_limit", 60) or 60))
+    return _DIRECT_THROTTLE
+
+
+def _client_ip() -> str:
+    return str(getattr(_local, "client_addr", "") or "")
+
+
+def _client_token(body: dict | None = None) -> str:
+    """浏览器令牌：优先请求头，其次 body/query（GET 也走头）。"""
+    tok = str(getattr(_local, "token", "") or "").strip()
+    if not tok and body:
+        tok = str(body.get("token") or "").strip()
+    return tok
+
+
+def _only_digits(text: str) -> str:
+    return re.sub(r"\D", "", str(text or ""))
+
+
+def _persist_days() -> int:
+    return int(direct_cfg().get("persist_days", 30) or 30)
+
+
+def _direct_client(school_code: str, school_name: str, dev_id: str = "") -> dl.DirectLogin:
+    c = direct_cfg()
+    return dl.DirectLogin(dev_id=dev_id or dl.device_id(),
+                          school_code=school_code,
+                          school_name=school_name,
+                          timeout=int(c.get("timeout", 20) or 20),
+                          verify_tls=bool(c.get("verify_tls", False)),
+                          app_all_version=str(c.get("app_all_version") or dl.APP_ALL_VERSION),
+                          client_id=str(c.get("client_id") or dl.CLIENT_ID))
+
+
+def api_direct_schools(q):
+    """可选学校列表（内置，不依赖任何第三方接口）。"""
+    kw = (q.get("q") or [""])[0]
+    return {"ok": True, "schools": ds.search(kw), "default": ds.DEFAULT_CODE}
+
+
+def api_direct_start(body):
+    """第 1 步：取图形验证码，建一个 30 分钟的内存会话。"""
+    c = direct_cfg()
+    raw = str(body.get("school") or body.get("school_code") or "").strip()
+    if raw:
+        code, name = ds.resolve(raw)
+        if not code:
+            if re.fullmatch(r"[A-Za-z0-9]{2,12}", raw):
+                code, name = raw, ""          # 列表里没有，用户手填的代码
+            else:
+                raise dl.LoginError("请从列表里选学校", "config")
+    else:
+        code = str(c.get("school_code") or ds.DEFAULT_CODE)
+        name = str(c.get("school_name") or ds.DEFAULT_NAME)
+
+    ip = _client_ip() or "unknown"
+    throttle = direct_throttle()
+    throttle.check(ip)
+    throttle.mark(ip)
+
+    s = direct_sessions().create(dl.device_id(), code, name)
+    s.client = _direct_client(code, name, dev_id=s.client.dev_id)
+    warning = ""
+    try:
+        st = s.client.security_token()
+        s.security_token = st["security_token"]
+        s.captcha_level = int(st.get("level") or 0)
+        cap = s.client.captcha_image(s.security_token)
+        s.captcha_required = True
+    except dl.LoginError as e:
+        if e.kind not in ("captcha", "token", "upstream"):
+            direct_sessions().drop(s.sid)
+            raise
+        # 取不到图：退化成「不带图形码发短信」，上游若要求会明确报错
+        cap = {"image": "", "mime": "", "data_uri": ""}
+        s.captcha_required = False
+        warning = "验证码没加载出来，这次先直接发短信。"
+
+    out = s.view()
+    out.update({
+        "ok": True,
+        "captcha": cap,
+        "warning": warning,
+        "hint": "验证码会发到这个号码上。",
+    })
+    return out
+
+
+def api_direct_captcha(body):
+    """换一张：重新取 securityToken + 图形验证码。"""
+    s = direct_sessions().get(body.get("session_id"))
+    st = s.client.security_token()
+    s.security_token = st["security_token"]
+    s.captcha_level = int(st.get("level") or 0)
+    cap = s.client.captcha_image(s.security_token)
+    s.captcha_required = True
+    s.step = "started"
+    out = s.view()
+    out.update({"ok": True, "captcha": cap})
+    return out
+
+
+def api_direct_send_code(body):
+    """第 2 步：发短信（必须带图形验证码；只发到手机号本人）。"""
+    s = direct_sessions().get(body.get("session_id"))
+    phone = _only_digits(body.get("phone") or s.phone)
+    captcha = str(body.get("captcha") or "").strip()
+    if not (len(phone) == 11 and phone.isdigit()):
+        raise dl.LoginError("请输入 11 位手机号", "phone")
+    if s.captcha_required and not captcha:
+        raise dl.LoginError("请先输入图形验证码", "captcha")
+    if not s.security_token:
+        raise dl.LoginError("会话里的登录票据丢了，请重新开始", "token")
+
+    lim = direct_limiter()
+    ip = _client_ip()
+    lim.check(phone, ip)
+
+    s.phone = phone
+    s.client.send_code(phone, s.security_token, captcha)
+    lim.mark(phone, ip)
+    s.sends += 1
+    s.step = "sent"
+
+    out = s.view()
+    out.update({
+        "ok": True,
+        "message": f"验证码已发送至 {dl.mask_phone(phone)}，请查看短信",
+        "hint": "短信有时会延迟几分钟；重复获取还是同一条验证码。",
+    })
+    return out
+
+
+def api_direct_login(body):
+    """第 3 步：短信码登录 → 换 shiroJID → 查已绑定寝室 → 发浏览器令牌。"""
+    s = direct_sessions().get(body.get("session_id"))
+    code = _only_digits(body.get("sms_code") or body.get("code"))
+    if not s.phone:
+        raise dl.LoginError("请先获取短信验证码", "code")
+    if not (4 <= len(code) <= 8):
+        raise dl.LoginError("请输入短信里的数字验证码", "code")
+
+    s.client.login_by_code(s.phone, code)
+    ym_code = s.client.auth_code()
+    s.client.shiro_jid(ym_code)
+    s.step = "logged_in"
+    s.rooms = s.client.query_bind()
+
+    out: dict = {
+        "ok": True,
+        "session_id": s.sid,
+        "step": s.step,
+        "rooms": [dict(r) for r in s.rooms],
+    }
+    if not s.rooms:
+        out["warning"] = "登录成功，但这个手机号名下没有绑定寝室。"
+        return out
+
+    # 落库成这个手机号的账号 + 浏览器令牌（下次打开不用再收短信）
+    conn_ = conn()
+    user = dstore.upsert_user(conn_, s.phone, s.client.school_code,
+                              s.client.school_name, s.client.uid)
+    dstore.save_rooms(conn_, user["id"], s.rooms)
+    token, row = dstore.create_session(conn_, user["id"], s.client.session_token,
+                                       days=_persist_days(), ip=_client_ip())
+    out.update({
+        "token": token,
+        "user": dstore.public_user(user),
+        "expires_at": row.get("expires_at"),
+    })
+    return out
+
+
+def api_direct_session(q):
+    """页面打开时用它恢复登录状态（令牌在请求头 X-YS-Token 或 ?token=）。"""
+    tok = (q.get("token") or [""])[0] or _client_token()
+    if not tok:
+        return {"ok": True, "exists": False}
+    conn_ = conn()
+    row = dstore.get_session(conn_, dstore.hash_token(tok))
+    if not row:
+        return {"ok": True, "exists": False}
+    dstore.touch_session(conn_, str(row["token_hash"]), days=_persist_days())
+    rooms = dstore.list_rooms(conn_, int(row["user_id"]))
+    return {
+        "ok": True,
+        "exists": True,
+        "user": dstore.public_user(row),
+        "rooms": rooms,
+        "has_login": bool(row.get("shiro_sealed")),
+        "expires_at": row.get("expires_at"),
+    }
+
+
+def api_direct_logout(body):
+    tok = _client_token(body)
+    if tok:
+        dstore.delete_session(conn(), dstore.hash_token(tok))
+    sid = str(body.get("session_id") or "")
+    if sid:
+        direct_sessions().drop(sid)
+    return {"ok": True}
+
+
+def _query_by_token(tok: str, body: dict) -> dict:
+    """用浏览器令牌直接查：不经过短信，用的是加密存在库里的 shiroJID。"""
+    conn_ = conn()
+    th = dstore.hash_token(tok)
+    row = dstore.get_session(conn_, th)
+    if not row:
+        raise dl.LoginError("登录已过期，请重新验证手机号", "relogin")
+    rooms = dstore.list_rooms(conn_, int(row["user_id"]))
+    if not rooms:
+        raise dl.LoginError("这个账号还没有绑定寝室", "relogin")
+    try:
+        idx = int(body.get("room_index", body.get("room", 0)) or 0)
+    except (TypeError, ValueError):
+        idx = 0
+    if not 0 <= idx < len(rooms):
+        raise dl.LoginError("没有这个寝室，请重新选择", "upstream")
+    room = rooms[idx]
+
+    shiro = dstore.get_shiro(conn_, row)
+    if not shiro:
+        raise dl.LoginError("需要重新验证一次手机号", "relogin")
+
+    cli = _direct_client(str(row.get("school_code") or ""), str(row.get("school_name") or ""))
+    try:
+        res = cli.query_room_surplus(room, shiro)
+    except dl.LoginError as e:
+        if e.kind in ("expired", "token"):
+            dstore.set_shiro(conn_, th, "")      # 票据废了，别反复拿它去撞上游
+            raise dl.LoginError("登录已失效，重新验证一下手机号就行", "relogin") from None
+        raise
+
+    dstore.update_balance(conn_, int(room["id"]), res.get("amount"), res.get("surplus"))
+    dstore.touch_session(conn_, th, days=_persist_days())
+    return {
+        "ok": True,
+        "user": dstore.public_user(row),
+        "room": room,
+        "balance": res,
+        "raw": res.get("data"),
+        "expires_at": row.get("expires_at"),
+    }
+
+
+def api_direct_query(body):
+    """第 4 步：查余额。有浏览器令牌就直接查，没有才用 30 分钟的内存会话。"""
+    tok = _client_token(body)
+    if tok:
+        return _query_by_token(tok, body)
+
+    s = direct_sessions().get(body.get("session_id"))
+    if s.step != "logged_in" or not s.rooms:
+        raise dl.LoginError("还没有查到已绑定的寝室，请先完成登录", "expired")
+    try:
+        idx = int(body.get("room_index", body.get("room", 0)) or 0)
+    except (TypeError, ValueError):
+        idx = 0
+    if not 0 <= idx < len(s.rooms):
+        raise dl.LoginError("没有这个寝室，请重新选择", "upstream")
+
+    room = s.rooms[idx]
+    res = s.client.query_room_surplus(room)
+    return {
+        "ok": True,
+        "session_id": s.sid,
+        "room": room,
+        "balance": res,
+        "raw": res.get("data"),
+        "expire_at": s.expire_at(),
+    }
+
+
+def api_direct_status(q):
+    """页面刷新后可以用 session_id 找回进度（不返回任何凭据）。"""
+    sid = (q.get("session_id") or [""])[0]
+    try:
+        s = direct_sessions().get(sid)
+    except dl.LoginError:
+        return {"ok": True, "exists": False}
+    out = s.view()
+    out.update({"ok": True, "exists": True})
+    return out
+
+
+def api_direct_close(body):
+    direct_sessions().drop(body.get("session_id"))
+    return {"ok": True}
 
 
 def _fail(exc: BaseException, where: str) -> dict:
@@ -1039,6 +1390,10 @@ ROUTES_GET = {
     "/api/auth/buildings": api_auth_buildings,
     "/api/auth/floors": api_auth_floors,
     "/api/auth/rooms": api_auth_rooms,
+    "/api/direct/status": api_direct_status,
+    # 直连一次性查询
+    "/api/direct/schools": api_direct_schools,
+    "/api/direct/session": api_direct_session,
 }
 
 ROUTES_POST = {
@@ -1054,6 +1409,14 @@ ROUTES_POST = {
     "/api/auth/import-cookie": api_auth_import_cookie,
     "/api/auth/import-curl": api_auth_import_curl,
     "/api/auth/logout": api_auth_logout,
+    # 直连一次性查询（会话只在内存，不落库）
+    "/api/direct/start": api_direct_start,
+    "/api/direct/captcha": api_direct_captcha,
+    "/api/direct/send-code": api_direct_send_code,
+    "/api/direct/login": api_direct_login,
+    "/api/direct/query": api_direct_query,
+    "/api/direct/logout": api_direct_logout,
+    "/api/direct/close": api_direct_close,
 }
 
 
@@ -1067,6 +1430,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         super().log_message(fmt, *args)
 
+    def _write(self, data: bytes) -> None:
+        """写响应体。浏览器中途取消（刷新/关页）会抛这几个错，不该刷 traceback。"""
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            pass
+
     # -- utils
     def _json(self, obj, status=200):
         if isinstance(obj, dict) and "__csv__" in obj:
@@ -1077,7 +1447,7 @@ class Handler(BaseHTTPRequestHandler):
                              f'attachment; filename="{obj["filename"]}"')
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(data)
+            self._write(data)
             return
         data = json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status)
@@ -1086,7 +1456,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(data)
+        self._write(data)
 
     def _static(self, path: str):
         rel = path.lstrip("/") or "index.html"
@@ -1118,17 +1488,33 @@ class Handler(BaseHTTPRequestHandler):
         # 静态资源不缓存，避免改了前端却看到旧页面
         self.send_header("Cache-Control", "no-store, must-revalidate")
         self.end_headers()
-        self.wfile.write(data)
+        self._write(data)
 
     # -- verbs
+    def _addr(self) -> str:
+        """客户端地址（反代后面用 X-Forwarded-For 的第一跳）。"""
+        xff = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        if xff:
+            return xff
+        return self.client_address[0] if self.client_address else ""
+
+    def _stash(self) -> None:
+        """把每个请求都需要的上下文放进 thread-local。"""
+        _local.client_addr = self._addr()
+        _local.token = (self.headers.get("X-YS-Token") or "").strip()
+
     def do_GET(self):
         u = urlparse(self.path)
+        self._stash()
         if u.path in ROUTES_GET:
             q = parse_qs(u.query)
             try:
                 self._json(ROUTES_GET[u.path](q))
             except AuthError as e:
                 self._json({"error": str(e), "auth": True}, 400)
+            except dl.LoginError as e:
+                self._json({"error": str(e), "kind": e.kind, "direct": True},
+                           429 if e.kind == "limit" else 400)
             except Exception as e:  # noqa: BLE001
                 self._json(_fail(e, u.path), 500)
             return
@@ -1136,6 +1522,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
+        self._stash()
         fn = ROUTES_POST.get(u.path)
         if not fn:
             self._json({"error": "not found"}, 404)
@@ -1150,6 +1537,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(fn(body))
         except AuthError as e:
             self._json({"error": str(e), "auth": True}, 400)
+        except dl.LoginError as e:
+            self._json({"error": str(e), "kind": e.kind, "direct": True},
+                       429 if e.kind == "limit" else 400)
         except Exception as e:  # noqa: BLE001
             self._json(_fail(e, u.path), 500)
 
@@ -1157,6 +1547,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type,X-YS-Token")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
@@ -1410,6 +1801,8 @@ def main():
     print(f"→ 仪表盘  http://{host}:{port}/")
     if kind == "nofish":
         print(f"→ 登录页  http://{host}:{port}/login")
+    if (CFG.get("direct") or {}).get("enabled", True):
+        print(f"→ 直连查询 http://{host}:{port}/direct")
     print(f"→ 接口    http://{host}:{port}/api/summary")
     print("Ctrl+C 退出")
     try:

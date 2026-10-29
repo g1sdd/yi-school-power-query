@@ -77,6 +77,31 @@ DEFAULTS: dict[str, Any] = {
             "critical_kwh": 5.0,
         }
     ],
+    # 直连查询（/direct）：任意用户用本人手机号 + 本人短信验证码
+    # 登录易校园官方 App 接口，查自己的电费。支持多用户：各账号互不影响。
+    "direct": {
+        "enabled": True,
+        # 默认学校：中国计量大学。页面上可以改。
+        "school_code": "10356",
+        "school_name": "中国计量大学",
+        # 登录过程（验证码→短信→登录）的一次性会话，只在内存里
+        "session_ttl_minutes": 30,
+        "max_sessions": 500,
+        # 浏览器记住登录多少天；shiroJID 加密存本机库
+        "persist_days": 30,
+        # 发短信限流（上游自己也有风控，本地先拦一道）
+        "send_interval_seconds": 60,
+        "phone_daily_limit": 6,
+        "ip_daily_limit": 20,
+        # /direct/start 每 IP 每小时上限（每次会打两下上游，别让人刷）
+        "start_hourly_limit": 60,
+        "timeout": 20,
+        # 上游证书异常时是否严格校验；默认关（与 source.strict_tls 一致的做法）
+        "verify_tls": False,
+        # 上游版本号：易校园改版时需要跟着改
+        "app_all_version": "7.3.6",
+        "client_id": "65l3attk4r095ib",
+    },
     "collect": {
         # 易校园每小时更新一次电费，所以默认按小时采集
         "interval_minutes": 60,
@@ -166,7 +191,10 @@ def _mini_yaml(text: str) -> dict:
         if line.startswith("- "):
             item = line[2:].strip()
             if isinstance(parent, list):
-                if ":" in item:
+                if item.startswith("{"):
+                    # 行内写法：- { from: "2026-07-01", to: "2026-08-31" }
+                    parent.append(_coerce(item))
+                elif ":" in item:
                     k, _, v = item.partition(":")
                     d = {k.strip(): _coerce(v.strip())}
                     parent.append(d)
@@ -201,10 +229,69 @@ def _peek_child(text: str, raw: str) -> bool:
     return False
 
 
+def _strip_comment(val: str) -> str:
+    """去掉行尾注释。YAML 规则：只有「空白 + #」才是注释起点。
+
+    这样 `label: 3#楼 502` 里的 # 不会被当成注释，
+    而 `send_interval_seconds: 60   # 同一手机号...` 能正确得到 60。
+    """
+    out: list[str] = []
+    quote = ""
+    for ch in val:
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+            out.append(ch)
+        elif ch == "#" and out and out[-1] in " \t":
+            break
+        else:
+            out.append(ch)
+    return "".join(out).strip()
+
+
+def _split_flow(text: str) -> list[str]:
+    """按逗号切分行内写法，引号里的逗号不算。"""
+    parts: list[str] = []
+    buf: list[str] = []
+    quote = ""
+    for ch in text:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+            buf.append(ch)
+        elif ch == ",":
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        parts.append("".join(buf))
+    return parts
+
+
 def _coerce(v: str) -> Any:
-    v = v.strip()
+    v = _strip_comment(v)
     if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
         return v[1:-1]
+    # 行内写法：[4, 5] / { from: "2026-07-01", note: "暑假" }
+    if len(v) >= 2 and v[0] == "[" and v[-1] == "]":
+        inner = v[1:-1].strip()
+        return [_coerce(x) for x in _split_flow(inner)] if inner else []
+    if len(v) >= 2 and v[0] == "{" and v[-1] == "}":
+        inner = v[1:-1].strip()
+        out: dict[str, Any] = {}
+        if inner:
+            for part in _split_flow(inner):
+                k, _, val = part.partition(":")
+                if k.strip():
+                    out[k.strip().strip("\"'")] = _coerce(val)
+        return out
     low = v.lower()
     if low in ("true", "yes", "on"):
         return True
