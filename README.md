@@ -30,13 +30,17 @@ python cli.py serve     # 或者打开 /setup 跟着向导走
 
 ## 数据源
 
-| `source.type` | 说明 | 需要什么 |
+| `source.type` | 走谁的接口 | 需要什么 |
 |---|---|---|
-| `nofish` | 本项目后端替你完成验证码登录（默认） | 手机号 + 短信码 |
-| `demo` | 生成带真实感的演示曲线 | 无 |
-| `xiaofubao` | 直接调易校园上游接口 | 抓包得到 `shiroJID` 与房间参数 |
+| `nofish` | **第三方代理 `tool.no-fish.cn`**：发短信、登录、查余额、查历史全在它那边 | 手机号 + 短信码 |
+| `demo` | 本地生成，不联网 | 无 |
+| `xiaofubao` | 直接调易校园 `application.xiaofubao.com` | 抓包得到的 `shiroJID` 与房间参数 |
 
-另有网页登录 `/login`（见下），不需要改 `source.type`。
+> `nofish` 是默认值，数据来源就是那个第三方站点：手机号和短信码会发给它，
+> 由它登录易校园并保存会话。要完全不经过第三方，用下面 `/login` 的直连登录
+> （手机号 + 短信码只发给易校园官方接口），或者 `xiaofubao` 模式。
+
+另有网页登录 `/login`（见下），不需要改 `source.type`；它和 `source.type` 是两条独立的路。
 
 ## 登录与多人查询
 
