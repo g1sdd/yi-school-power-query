@@ -343,8 +343,89 @@ class XiaofubaoAdapter(BaseAdapter):
         raise SourceError(f"上游响应无法解析：{json.dumps(payload, ensure_ascii=False)[:300]}")
 
 
-def build_adapter(cfg: dict, session: dict | None = None) -> BaseAdapter:
-    """session 来自登录态（ysp.auth.load_session），优先级高于 config。"""
+class DirectAdapter(BaseAdapter):
+    """直连易校园 App 接口：会话来自 `/login` 登录后加密存的 shiroJID。
+
+    和 xiaofubao 模式的区别：不用抓包、不用手填 Cookie，账号在网页上登录一次即可；
+    和 nofish 模式的区别：请求直接发往 `application.xiaofubao.com`，不经过第三方。
+
+    同一寝室有多个账号登录时**轮询**着用（见 direct_store.room_sessions）：
+    每轮换一个账号，单账号请求频率降到 1/N，风控更不容易被触发。
+    """
+
+    name = "direct"
+
+    def __init__(self, cfg: dict, conn=None):
+        super().__init__(cfg)
+        self.conn = conn
+        src = cfg["source"]
+        self.timeout = int(src.get("timeout", 20))
+        self.verify_tls = bool((cfg.get("direct") or {}).get("verify_tls", False))
+        self.need_relogin = False
+        self.last_user = ""
+
+    def _db(self):
+        if self.conn is None:
+            from .. import db as _db
+            from ..config import db_path
+            self.conn = _db.connect(db_path(self.cfg))
+        return self.conn
+
+    def check(self) -> str:
+        from .. import direct_store as dstore
+
+        conn = self._db()
+        stat = dstore.stats(conn)
+        rooms = dstore.ensure_local_rooms(conn)
+        return (f"有 {stat['users']} 个账号 / {stat['sessions']} 个浏览器会话 / "
+                f"{stat['rooms']} 个寝室（新登记 {rooms} 个）")
+
+    def fetch(self, room: dict) -> Reading:
+        from .. import direct_login as dlg
+        from .. import direct_store as dstore
+
+        conn = self._db()
+        cands = dstore.room_sessions(conn, room)
+        if not cands:
+            raise SourceError("这个寝室还没有可用的登录，去 /login 收一次短信验证码")
+
+        last: Exception | None = None
+        for c in cands:
+            cli = dlg.DirectLogin(dev_id=dlg.device_id(),
+                                  school_code=str(c["school_code"] or ""),
+                                  school_name=str(c["school_name"] or ""),
+                                  timeout=self.timeout, verify_tls=self.verify_tls)
+            try:
+                res = cli.query_room_surplus(room, c["shiro"])
+            except dlg.LoginError as e:
+                if e.kind in ("expired", "token"):
+                    # 这个账号的票据被上游废了：清掉，换下一个账号，本轮不算失败
+                    dstore.set_shiro(conn, str(c["token_hash"]), "")
+                    last = e
+                    continue
+                raise SourceError(str(e)) from None
+
+            self.last_user = str(c["phone"] or "")
+            amount = res.get("amount")
+            surplus = res.get("surplus")
+            if amount is not None:
+                return Reading(room["room_key"], None, float(amount),
+                               raw=res.get("data"), source=self.name, unit="cny")
+            if surplus is not None:
+                return Reading(room["room_key"], float(surplus), None,
+                               raw=res.get("data"), source=self.name, unit="kwh")
+            raise SourceError("上游没有返回余额字段")
+
+        # 所有账号都失效了
+        self.need_relogin = True
+        raise SourceError(f"登录都失效了，去 /login 重新验证一次手机号（{last}）")
+
+
+def build_adapter(cfg: dict, session: dict | None = None, conn=None) -> BaseAdapter:
+    """session 来自登录态（ysp.auth.load_session），优先级高于 config。
+
+    conn：`direct` 模式需要读库里的会话，传进来可以复用采集器的连接。
+    """
     s = session or {}
     # 会话里显式指定了数据源就用它（例如粘贴 Cookie 导入的 xiaofubao 会话）
     kind = str(s.get("source_type") or cfg["source"].get("type", "demo")).lower()
@@ -355,6 +436,8 @@ def build_adapter(cfg: dict, session: dict | None = None) -> BaseAdapter:
                                 ym_id=s.get("ym_id"),
                                 endpoint=s.get("endpoint"),
                                 body=s.get("request_body"))
+    if kind == "direct":
+        return DirectAdapter(cfg, conn=conn)
     from .demo import DemoAdapter
 
     return DemoAdapter(cfg)

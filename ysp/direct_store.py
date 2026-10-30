@@ -1,4 +1,4 @@
-﻿"""`/direct` 的多用户存储：账号、浏览器令牌、房间、最近余额。
+"""`/direct` 的多用户存储：账号、浏览器令牌、房间、最近余额。
 
 和现有单用户采集完全隔离 —— 用的是 `d` 前缀的新表，**不碰** `rooms` / `readings` /
 `meta.session`，所以别人登录不会覆盖本站主人的 nofish 登录态。
@@ -289,3 +289,93 @@ def stats(conn: sqlite3.Connection) -> dict[str, Any]:
         "sessions": one("SELECT COUNT(*) FROM dsessions"),
         "rooms": one("SELECT COUNT(*) FROM drooms"),
     }
+
+
+# ---------------------------------------------------------------- 给采集器用
+
+TURN_KEY = "direct_turn:"
+
+
+def room_sessions(conn: sqlite3.Connection, room: dict, rotate: bool = True) -> list[dict]:
+    """能查这个寝室的所有会话，按「轮询起点」排好序。
+
+    同一个寝室可能被多个账号绑定（室友各登一个），采集时**轮着用**：
+    每轮换一个账号，单账号的请求频率降到 1/N，上游风控更不容易被触发。
+
+    返回的 shiro 已解密，只留在内存里，别打印。
+    """
+    ensure(conn)
+    from . import db
+
+    rows = conn.execute(
+        "SELECT s.token_hash, s.user_id, s.shiro_sealed, s.last_seen,"
+        "       u.phone, u.school_code, u.school_name"
+        "  FROM dsessions s"
+        "  JOIN dusers u ON u.id = s.user_id"
+        "  JOIN drooms d ON d.user_id = s.user_id"
+        " WHERE d.area_id=? AND d.building_code=? AND d.floor_code=? AND d.room_code=?"
+        "   AND s.shiro_sealed <> ''"
+        " ORDER BY s.token_hash",
+        (str(room.get("area_id") or ""), str(room.get("building_code") or ""),
+         str(room.get("floor_code") or ""), str(room.get("room_code") or ""))).fetchall()
+
+    out: list[dict] = []
+    for r in rows:
+        shiro = get_shiro(conn, dict(r))
+        if not shiro:
+            continue
+        out.append({
+            "user_id": r["user_id"],
+            "phone": r["phone"],
+            "school_code": r["school_code"],
+            "school_name": r["school_name"],
+            "token_hash": r["token_hash"],
+            "shiro": shiro,
+        })
+    if rotate and len(out) > 1:
+        key = TURN_KEY + str(room.get("room_key") or "")
+        turn = int(db.get_meta(conn, key, 0) or 0)
+        idx = turn % len(out)
+        out = out[idx:] + out[:idx]
+        db.set_meta(conn, key, turn + 1)
+    return out
+
+
+def ensure_local_rooms(conn: sqlite3.Connection) -> int:
+    """把已登录账号的寝室登记到采集用的 `rooms` 表（已存在就跳过）。
+
+    同一个房间被多个人绑定时只登记一次 —— room_key 由
+    area/building/floor/room 拼出来，跟账号无关。
+    """
+    from . import db
+
+    ensure(conn)
+    existing = {str(r["room_key"]) for r in db.list_rooms(conn)}
+    added = 0
+    for user in conn.execute("SELECT id, school_code, school_name FROM dusers"):
+        for r in list_rooms(conn, int(user["id"])):
+            key = "-".join(str(x or "0") for x in (
+                r["area_id"], r["building_code"], r["floor_code"], r["room_code"]))
+            if key in existing:
+                continue
+            db.upsert_room(conn, {
+                "room_key": key,
+                "label": str(r["label"] or r["room_code"] or key),
+                "school_code": str(user["school_code"] or ""),
+                "school_name": str(user["school_name"] or ""),
+                "area_id": r["area_id"] or "",
+                "area_name": "",
+                "building_code": r["building_code"] or "",
+                "building_name": "",
+                "floor_code": r["floor_code"] or "",
+                "floor_name": "",
+                "room_code": r["room_code"] or "",
+                "room_name": r["label"] or "",
+                "unit_price": 0.538,
+                "warn_kwh": 20.0,
+                "critical_kwh": 5.0,
+                "enabled": 1,
+            })
+            existing.add(key)
+            added += 1
+    return added

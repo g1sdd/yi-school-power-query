@@ -1,4 +1,4 @@
-﻿"""直连登录的离线测试：AES / 签名 / 全链路（mock 上游）/ 会话 / 限流。
+"""直连登录的离线测试：AES / 签名 / 全链路（mock 上游）/ 会话 / 限流。
 
 跑法::
 
@@ -168,6 +168,7 @@ class MockUpstream:
         self.lock = threading.Lock()
         self.require_json_bind = False     # True：queryBind 只接受 JSON（测兜底）
         self.shiro = "fake-shiro-jid-0001"
+        self.accept_shiros: set[str] = set()   # 空集合时只认 self.shiro
         self.security_token = ""
         self.captcha_code = "y4pm"
         self.sms_code = "123456"
@@ -330,7 +331,8 @@ class MockUpstream:
 
             def _cookie_ok(self):
                 c = self.headers.get("Cookie") or ""
-                return f"shiroJID={outer.shiro}" in c
+                valid = outer.accept_shiros or {outer.shiro}
+                return any(f"shiroJID={s}" in c for s in valid)
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
         self.port = self.httpd.server_address[1]

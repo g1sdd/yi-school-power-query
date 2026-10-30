@@ -16,6 +16,7 @@ from typing import Any
 
 from . import alerts as alert_engine
 from . import analyze, db
+from . import direct_store as dstore
 from .adapters import SourceError, build_adapter
 from .auth import load_session, resolve_phone, resolve_school, save_session
 from .config import db_path, load_config
@@ -32,7 +33,17 @@ def collect_once(cfg: dict | None = None, room_key: str | None = None,
     cfg = cfg or load_config()
     conn = db.connect(db_path(cfg))
     session = load_session(conn)
-    adapter = build_adapter(cfg, session)
+    adapter = build_adapter(cfg, session, conn=conn)
+
+    # 直连模式：先把登录过的账号的寝室登记进 rooms，否则第一次跑还没有可采的房间
+    if getattr(adapter, "name", "") == "direct":
+        try:
+            added = dstore.ensure_local_rooms(conn)
+            if added and verbose:
+                print(f"[i] 从登录账号登记了 {added} 个寝室")
+        except Exception as e:  # noqa: BLE001
+            if verbose:
+                print(f"[~] 登记寝室失败：{e}")
 
     rooms = db.list_rooms(conn, enabled_only=True)
     if room_key:
@@ -91,7 +102,7 @@ def collect_once(cfg: dict | None = None, room_key: str | None = None,
             results.append(entry)
             if verbose:
                 print(f"[x] {room['label']}: {err}")
-            if _mark_relogin_if_needed(cfg, conn, adapter):
+            if _mark_relogin_if_needed(cfg, conn, adapter) or getattr(adapter, "need_relogin", False):
                 entry["need_relogin"] = True
                 any_relogin = True
             continue

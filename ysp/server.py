@@ -322,6 +322,7 @@ def api_direct_login(body):
     user = dstore.upsert_user(conn_, s.phone, s.client.school_code,
                               s.client.school_name, s.client.uid)
     dstore.save_rooms(conn_, user["id"], s.rooms)
+    dstore.ensure_local_rooms(conn_)      # 让仪表盘/采集马上认得这个寝室
     token, row = dstore.create_session(conn_, user["id"], s.client.session_token,
                                        days=_persist_days(), ip=_client_ip())
     # 浏览器走 Cookie：httpOnly，JS 读不到，刷新/关掉再开都还在

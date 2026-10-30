@@ -181,12 +181,11 @@ def cmd_check(argv):
     #    会误报"尚未登录"（明明已经登录过了）。
     conn = db.connect(db_path(cfg))
     session = load_session(conn)
-    ad = build_adapter(cfg, session)
+    ad = build_adapter(cfg, session, conn=conn)
     port = cfg["app"].get("port", 8787)
     print(f"数据源：{ad.name}（{cfg['_config_path']}）")
     if ad.name == "nofish":
         print(f"登录手机号：{resolve_phone(cfg, conn) or '（无）'}")
-    conn.close()
     try:
         print(ad.check())
     except SourceError as e:
@@ -194,6 +193,8 @@ def cmd_check(argv):
         if "尚未登录" in str(e):
             print(f"→ 打开 http://127.0.0.1:{port}/login 用手机验证码登录，或运行 python cli.py login")
         return 1
+    finally:
+        conn.close()
     return 0
 
 
